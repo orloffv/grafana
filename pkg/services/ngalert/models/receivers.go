@@ -2,17 +2,14 @@ package models
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"maps"
 	"math"
 	"slices"
 	"sort"
 	"strings"
-	"unsafe"
 
 	alertingNotify "github.com/grafana/alerting/notify"
 
@@ -553,41 +550,16 @@ func (r *Receiver) GetUID() string {
 }
 
 func (r *Receiver) Fingerprint() string {
-	sum := fnv.New64()
-
-	writeBytes := func(b []byte) {
-		_, _ = sum.Write(b)
-		// add a byte sequence that cannot happen in UTF-8 strings.
-		_, _ = sum.Write([]byte{255})
-	}
-	writeString := func(s string) {
-		if len(s) == 0 {
-			writeBytes(nil)
-			return
-		}
-		// #nosec G103
-		// avoid allocation when converting string to byte slice
-		writeBytes(unsafe.Slice(unsafe.StringData(s), len(s)))
-	}
-	// this temp slice is used to convert ints to bytes.
-	tmp := make([]byte, 8)
-	writeInt := func(u int) {
-		binary.LittleEndian.PutUint64(tmp, uint64(u))
-		writeBytes(tmp)
-	}
+	sum := newFingerprint()
 
 	writeIntegration := func(in *Integration) {
-		writeString(in.UID)
-		writeString(in.Name)
+		sum.writeString(in.UID)
+		sum.writeString(in.Name)
 
 		// Do not include fields in fingerprint as these are not part of the receiver definition.
-		writeString(in.Config.Type)
+		sum.writeString(in.Config.Type)
 
-		if in.DisableResolveMessage {
-			writeInt(1)
-		} else {
-			writeInt(0)
-		}
+		sum.writeBool(in.DisableResolveMessage)
 
 		// allocate a slice that will be used for sorting keys, so we allocate it only once
 		var keys []string
@@ -610,42 +582,51 @@ func (r *Receiver) Fingerprint() string {
 			sub := keys[:idx]
 			sort.Strings(sub)
 			for _, name := range sub {
-				writeString(name)
-				writeString(secureSettings[name])
+				sum.writeString(name)
+				sum.writeString(secureSettings[name])
 			}
 		}
-		writeSettings(writeBytes, in.Settings)
+		writeSettings(sum, in.Settings)
 		writeSecureSettings(in.SecureSettings)
 	}
 
 	// fields that determine the rule state
-	writeString(r.UID)
-	writeString(r.Name)
-	writeString(string(r.Provenance))
+	sum.writeString(r.UID)
+	sum.writeString(r.Name)
+	sum.writeString(string(r.Provenance))
 
 	for _, integration := range r.Integrations {
 		writeIntegration(integration)
 	}
 
-	return fmt.Sprintf("%016x", sum.Sum64())
+	return sum.String()
 }
 
-func writeSettings(w func([]byte), m map[string]any) {
+func writeSettings(f fingerprint, m map[string]any) {
+	if len(m) == 0 {
+		f.writeBytes(nil)
+		return
+	}
 	keysIter := maps.Keys(m)
 	keys := slices.Collect(keysIter)
 	sort.Strings(keys)
 	for _, key := range keys {
+		f.writeString(key)
 		switch v := m[key].(type) {
 		case string:
-			w([]byte(v))
+			f.writeString(v)
+		case bool:
+			f.writeBool(v)
+		case float64: // unmarshalling to map[string]any represents all numbers as float64
+			f.writeFloat64(v)
 		case map[string]any:
-			writeSettings(w, v)
+			writeSettings(f, v)
 		default:
 			b, err := json.Marshal(v)
 			if err != nil {
-				w([]byte(fmt.Sprintf("%+v", v)))
+				f.writeString(fmt.Sprintf("%+v", v))
 			}
-			w(b)
+			f.writeBytes(b)
 		}
 	}
 }
